@@ -122,7 +122,8 @@ int main(int argc, char *argv[]) {
     if (!std::getline(std::cin, line))
       break;
 
-    const std::unordered_set<std::string> builtin = {"echo", "type", "exit"};
+    const std::unordered_set<std::string> builtin = {"echo", "type", "exit",
+                                                     "pwd"};
 
     Command cmd = parse_cmd(line);
     const std::string &kw = cmd.name;
@@ -149,6 +150,8 @@ int main(int argc, char *argv[]) {
           std::cout << "Usage: type commmand";
         }
       }
+    } else if (kw == "pwd") {
+
     } else if (!exe.empty()) {
       cmd.name = exe.string();
       runExternal(cmd);
