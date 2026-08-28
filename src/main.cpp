@@ -1,4 +1,6 @@
 #include <cerrno>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -6,12 +8,13 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <system_error>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
-#include <wait.h>
 
 constexpr char path_list_separator = ':';
 
@@ -20,30 +23,44 @@ struct Command {
   std::vector<std::string> args;
 };
 
-pid_t runExternal(const Command &cmd) {
+std::filesystem::path expand_tilde(const std::filesystem::path &p) {
 
-  std::vector<char *> argv;
+  const char *home = getenv("HOME");
+  const auto &native_str = p.native();
+
+  if (native_str[0] != '~')
+    return p;
+  if (native_str == "~" || native_str.empty())
+    return std::filesystem::path(home);
+  if (native_str[1] == '/')
+    return std::filesystem::path(home) / native_str.substr(2);
+  return p;
+}
+
+pid_t run_external(const Command &cmd) {
+
+  std::vector<const char *> argv;
   argv.reserve(cmd.args.size() + 2);
 
-  argv.push_back(const_cast<char *>(cmd.name.c_str()));
-  for (auto &arg : cmd.args)
-    argv.push_back(const_cast<char *>(arg.c_str()));
+  argv.push_back(cmd.name.c_str());
+  for (const auto &arg : cmd.args)
+    argv.push_back(arg.c_str());
   argv.push_back(nullptr);
 
-  pid_t c_pid = fork();
+  pid_t child_pid = fork();
 
-  if (c_pid == -1) {
+  if (child_pid == -1) {
     throw std::runtime_error("fork failed: " +
                              std::string(std::strerror(errno)));
-  } else if (c_pid > 0) {
+  } else if (child_pid > 0) {
 
     int status;
-    if (waitpid(c_pid, &status, 0) == -1) {
-      // You can either throw, log, or ignore depending on your design
+    if (waitpid(child_pid, &status, 0) == -1) {
+      std::cerr << "waitpid failed: " << std::strerror(errno) << std::endl;
     }
 
   } else {
-    execv(cmd.name.c_str(), argv.data());
+    execv(cmd.name.c_str(), const_cast<char *const *>(argv.data()));
 
     const char *msg = "execv failed: ";
     write(STDERR_FILENO, msg, std::strlen(msg));
@@ -52,7 +69,7 @@ pid_t runExternal(const Command &cmd) {
     write(STDERR_FILENO, "\n", 1);
     _exit(127);
   }
-  return c_pid;
+  return child_pid;
 }
 
 Command parse_cmd(const std::string &line) {
@@ -71,59 +88,55 @@ Command parse_cmd(const std::string &line) {
 }
 
 std::vector<std::filesystem::path> split_path_variable() {
-  std::vector<std::filesystem::path> dir;
+  std::vector<std::filesystem::path> dirs;
 
   const char *raw_path = std::getenv("PATH");
-  if (raw_path == nullptr) {
-    return dir;
-  }
+  if (!raw_path)
+    return dirs;
+
   std::string path_variable(raw_path);
   std::size_t start = 0;
 
-  while (start <= path_variable.size()) {
+  while (true) {
     const std::size_t end = path_variable.find(path_list_separator, start);
-    const std::string entry = path_variable.substr(start, end - start);
+    std::string entry = (end == std::string::npos)
+                            ? path_variable.substr(start)
+                            : path_variable.substr(start, end - start);
+
     if (!entry.empty())
-      dir.emplace_back(entry);
+      dirs.emplace_back(entry);
+
     if (end == std::string::npos)
       break;
     start = end + 1;
   }
 
-  return dir;
+  return dirs;
 }
+
 std::filesystem::path find_exec(const std::string &cmd) {
 
   for (const auto &dir : split_path_variable()) {
-
-    const auto candidate = dir / cmd;
-
     std::error_code ec;
-    auto st = std::filesystem::status(candidate, ec);
+    const auto candidate = dir / cmd;
+    std::string candidate_string = candidate.string();
 
-    if (ec)
-      continue;
-    if (!std::filesystem::is_regular_file(st))
-      continue;
-
-    if ((st.permissions() & std::filesystem::perms::owner_exec) !=
-        std::filesystem::perms::none) {
+    if (!access(candidate_string.c_str(), X_OK)) {
       return candidate;
     }
   }
-
   return {};
 }
 
-int main(int argc, char *argv[]) {
+int main(void) {
   while (1) {
-    std::cout << "$ ";
+    std::cout << "> ";
     std::string line;
     if (!std::getline(std::cin, line))
       break;
 
     const std::unordered_set<std::string> builtin = {"echo", "type", "exit",
-                                                     "pwd"};
+                                                     "pwd", "cd"};
 
     Command cmd = parse_cmd(line);
     const std::string &kw = cmd.name;
@@ -132,31 +145,54 @@ int main(int argc, char *argv[]) {
     if (kw == "exit") {
       break;
     } else if (kw == "echo") {
-      if (line.size() > 5) {
-        std::string msg = line.substr(5);
-        std::cout << msg << std::endl;
-      } else {
-        std::cout << "Usage: echo message" << std::endl;
+      for (std::size_t i = 0; i < cmd.args.size(); i++) {
+        if (i)
+          std::cout << ' ';
+        std::cout << cmd.args[i];
       }
+      std::cout << '\n';
     } else if (kw == "type") {
-      for (auto arg : cmd.args) {
-        if (builtin.find(arg) != builtin.end())
-          std::cout << arg << " is a shell builtin";
-        else if (!find_exec(arg).empty())
-          std::cout << arg << " is " << find_exec(arg) << std::endl;
-        else if (find_exec(arg).empty())
-          std::cout << "type: Command not found" << std::endl;
-        else {
-          std::cout << "Usage: type commmand";
+      for (const auto &arg : cmd.args) {
+        if (builtin.find(arg) != builtin.end()) {
+          std::cout << arg << " is a shell builtin\n";
+        } else {
+          auto exe = find_exec(arg);
+          if (!exe.empty()) {
+            std::cout << arg << " is " << exe << '\n';
+          } else {
+            std::cerr << "type: " << arg << ": not found\n";
+          }
         }
       }
     } else if (kw == "pwd") {
+      std::error_code pwdError;
+      std::filesystem::path currDir = std::filesystem::current_path(pwdError);
+      std::cout << (pwdError ? pwdError.message() : currDir.string())
+                << std::endl;
 
+    } else if (kw == "cd") {
+      std::filesystem::path dir;
+      if (cmd.args.empty()) {
+        const char *home = getenv("HOME");
+
+        if (!home) {
+          std::cerr << "cd: HOME not set\n";
+          continue;
+        }
+        dir = home;
+      } else {
+        dir = expand_tilde(cmd.args[0]);
+      }
+      std::error_code ec;
+      std::filesystem::current_path(dir, ec);
+      if (ec) {
+        std::cerr << "cd: " << dir << ec.message() << '\n';
+      }
     } else if (!exe.empty()) {
       cmd.name = exe.string();
-      runExternal(cmd);
+      run_external(cmd);
     } else
-      std::cout << kw << ": command not found" << std::endl;
+      std::cerr << kw << ": command not found" << std::endl;
   }
-  return 0;
+  return EXIT_SUCCESS;
 }
