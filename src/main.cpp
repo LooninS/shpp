@@ -130,7 +130,7 @@ std::filesystem::path find_exec(const std::string &cmd) {
 
 int main(void) {
   while (1) {
-    std::cout << "> ";
+    std::cout << "> " << std::flush;
     std::string line;
     if (!std::getline(std::cin, line))
       break;
